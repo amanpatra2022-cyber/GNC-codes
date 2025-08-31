@@ -1,0 +1,126 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from collections import defaultdict, deque
+from sklearn.cluster import DBSCAN
+
+model = YOLO("yolov8s.pt")
+
+video_path = r"C:\Users\amanp\Downloads\Shopping, People, Commerce, Mall, Many, Crowd, Walking   Free Stock video footage   YouTube.mp4"
+cap = cv2.VideoCapture(video_path)
+
+history = defaultdict(lambda: deque(maxlen=90))
+next_id = 0
+prev_centers = {}
+
+active_clusters = []
+CLUSTER_TTL = 15
+
+STABILITY_FRAMES = 15
+MOVEMENT_THRESH = 20
+CLUSTER_EPS = 90
+CLUSTER_MIN = 3
+MAX_DIST = 80
+
+def assign_ids(centers, prev_centers):
+    global next_id
+    assignments, used = [], set()
+    for c in centers:
+        best_id, best_dist = None, MAX_DIST
+        for pid, pc in prev_centers.items():
+            if pid in used:
+                continue
+            dist = np.linalg.norm(np.array(c) - np.array(pc))
+            if dist < best_dist:
+                best_id, best_dist = pid, dist
+        if best_id is None:
+            best_id = next_id
+            next_id += 1
+        else:
+            used.add(best_id)
+        assignments.append((c, best_id))
+    return assignments
+
+def cluster_still_valid(frame, box):
+    x, y, w, h = box
+    roi = frame[y:y+h, x:x+w]
+    if roi.size == 0:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return any(cv2.contourArea(c) > 500 for c in cnts)
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_copy = frame.copy()
+
+    results = model(frame, verbose=False)
+    centers, boxes = [], []
+
+    for r in results:
+        for box in r.boxes:
+            if int(box.cls[0]) == 0:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cx, cy = (x1+x2)//2, (y1+y2)//2
+                centers.append((cx, cy))
+                boxes.append([x1, y1, x2, y2])
+
+    assigned = assign_ids(centers, prev_centers)
+    prev_centers = {pid: c for c, pid in assigned}
+
+    standing_points = []
+
+    for (c, pid) in assigned:
+        history[pid].append(c)
+        cx, cy = c
+        cv2.circle(frame_copy, (cx, cy), 5, (0,255,0), -1)
+        if len(history[pid]) >= STABILITY_FRAMES:
+            xs, ys = zip(*history[pid])
+            movement = (max(xs)-min(xs)) + (max(ys)-min(ys))
+            if movement < MOVEMENT_THRESH:
+                cv2.circle(frame_copy, (cx, cy), 8, (255,0,0), -1)
+                standing_points.append(c)
+
+    new_clusters = []
+
+    if len(standing_points) >= CLUSTER_MIN:
+        clustering = DBSCAN(eps=CLUSTER_EPS, min_samples=CLUSTER_MIN).fit(standing_points)
+        labels = clustering.labels_
+        for cluster_id in set(labels):
+            if cluster_id == -1:
+                continue
+            cluster_pts = np.array([standing_points[i] for i in range(len(standing_points)) if labels[i]==cluster_id])
+            if len(cluster_pts) >= CLUSTER_MIN:
+                x,y,w,h = cv2.boundingRect(cluster_pts)
+                new_clusters.append((x,y,w,h))
+
+    updated_clusters = []
+    if new_clusters:
+        for box in new_clusters:
+            updated_clusters.append({"box": box, "life": CLUSTER_TTL})
+    else:
+        for cluster in active_clusters:
+            x,y,w,h = cluster["box"]
+            if cluster_still_valid(frame, (x,y,w,h)):
+                cluster["life"] -= 1
+                if cluster["life"] > 0:
+                    updated_clusters.append(cluster)
+
+    active_clusters = updated_clusters
+
+    for cluster in active_clusters:
+        x,y,w,h = cluster["box"]
+        cv2.rectangle(frame_copy, (x,y), (x+w,y+h), (0,0,255), 3)
+        cv2.putText(frame_copy, "Cluster", (x,y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+    cv2.imshow("Video", frame_copy)
+    if cv2.waitKey(10) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
