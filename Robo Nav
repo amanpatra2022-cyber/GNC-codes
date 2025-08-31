@@ -1,0 +1,171 @@
+import pygame
+import numpy as np
+import math
+
+WIDTH, HEIGHT = 800, 600
+SCALE = 40
+
+k_att = 3.0
+k_rep = 5.0
+d0 = 2.0
+
+goal = np.array([12.0, 8.0])
+pos  = np.array([0.0, 0.0])
+
+obstacles = []
+
+OBSTACLE_RADIUS = 0.25
+
+RAY_RADIUS = 5.0
+STEP_DEG = 5
+SAFE_MARGIN = 0.05
+
+DEFAULT_JERK = 0.2
+
+history = []
+stuck_flag = False
+path_points = []
+jerk_strength = DEFAULT_JERK
+
+def world_to_screen(p):
+    return int(p[0] * SCALE), HEIGHT - int(p[1] * SCALE)
+
+def screen_to_world(p):
+    return np.array([p[0] / SCALE, (HEIGHT - p[1]) / SCALE])
+
+def attractive_force(pos, goal):
+    return -k_att * (pos - goal)
+
+def repulsive_force(pos, obstacles):
+    F_rep = np.array([0.0, 0.0])
+    for obs in obstacles:
+        diff = pos - obs
+        dist = np.linalg.norm(diff)
+        if dist <= d0 and dist > 0.01:
+            F_rep += k_rep * ((1/dist - 1/d0) / (dist**3)) * (diff)
+    return F_rep
+
+def point_segment_distance(p, a, b):
+    ap = p - a
+    ab = b - a
+    ab_len2 = ab.dot(ab)
+    if ab_len2 == 0:
+        return np.linalg.norm(ap)
+    t = ap.dot(ab) / ab_len2
+    t_clamped = max(0.0, min(1.0, t))
+    closest = a + t_clamped * ab
+    return np.linalg.norm(p - closest)
+
+def cast_rays_check_segments(pos, goal, obstacles, radius=RAY_RADIUS, step_deg=STEP_DEG, safe_margin=SAFE_MARGIN):
+    dir_vec = goal - pos
+    base_angle = math.atan2(dir_vec[1], dir_vec[0])
+    rays = []
+    for deg in range(-90, 91, step_deg):
+        angle = base_angle + math.radians(deg)
+        ray_end = pos + radius * np.array([math.cos(angle), math.sin(angle)])
+        safe = True
+        min_dist = float('inf')
+        for obs in obstacles:
+            dist_to_seg = point_segment_distance(obs, pos, ray_end)
+            min_dist = min(min_dist, dist_to_seg)
+            if dist_to_seg <= (OBSTACLE_RADIUS + safe_margin):
+                safe = False
+        if not obstacles:
+            min_dist = radius
+        rays.append((angle, safe, ray_end, min_dist))
+    return rays
+
+def find_widest_gap_by_rays(rays):
+    clusters = []
+    current = []
+    indices = []
+    for i, (angle, safe, ray_end, min_dist) in enumerate(rays):
+        if safe:
+            current.append((angle, ray_end, min_dist))
+            indices.append(i)
+        else:
+            if current:
+                clusters.append((current, indices))
+                current = []
+                indices = []
+    if current:
+        clusters.append((current, indices))
+    if not clusters:
+        return None
+    best_cluster, best_indices = max(clusters, key=lambda ci: len(ci[0]))
+    score = len(best_cluster)
+    mid_index = len(best_cluster) // 2
+    angle, ray_end, min_dist = best_cluster[mid_index]
+    start_idx, end_idx = best_indices[0], best_indices[-1]
+    return angle, score, ray_end, start_idx, end_idx
+
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Potential Field Navigation (Segment-checked Rays)")
+clock = pygame.time.Clock()
+
+running = True
+while running:
+    clock.tick(30)
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            obstacles.append(screen_to_world(pygame.mouse.get_pos()))
+
+    F_att = attractive_force(pos, goal)
+    F_rep = repulsive_force(pos, obstacles)
+    F_tot = F_att + F_rep
+
+    if np.linalg.norm(F_tot) > 0:
+        pos = pos + 0.05 * (F_tot / np.linalg.norm(F_tot))
+
+    if len(path_points) == 0 or np.linalg.norm(pos - path_points[-1]) > 0.1:
+        path_points.append(pos.copy())
+
+    if np.linalg.norm(pos - goal) < 0.3:
+        print("Goal Reached!")
+        running = False
+        continue
+
+    history.append(pos.copy())
+    if len(history) > 20:
+        history.pop(0)
+        dist_moved = np.linalg.norm(history[-1] - history[0])
+        if dist_moved < 0.1 and np.linalg.norm(pos - goal) > 0.5:
+            stuck_flag = True
+        else:
+            stuck_flag = False
+
+    screen.fill((255, 255, 255))
+
+    pygame.draw.circle(screen, (0,200,0), world_to_screen(goal), int(0.25 * SCALE))
+    for obs in obstacles:
+        pygame.draw.circle(screen, (200,0,0), world_to_screen(obs), max(2, int(OBSTACLE_RADIUS * SCALE)))
+    for p in path_points:
+        pygame.draw.circle(screen, (0,0,0), world_to_screen(p), 2)
+    pygame.draw.circle(screen, (0,0,200), world_to_screen(pos), 8)
+
+    if stuck_flag:
+        rays = cast_rays_check_segments(pos, goal, obstacles, radius=RAY_RADIUS, step_deg=STEP_DEG, safe_margin=SAFE_MARGIN)
+        for i, (angle, safe, ray_end, min_dist) in enumerate(rays):
+            color = (0,180,0) if safe else (200,40,40)
+            thickness = 1 if safe else 2
+            pygame.draw.line(screen, color, world_to_screen(pos), world_to_screen(ray_end), thickness)
+        best = find_widest_gap_by_rays(rays)
+        if best:
+            best_angle, score, best_ray_end, start_idx, end_idx = best
+            pygame.draw.line(screen, (0,0,255), world_to_screen(pos), world_to_screen(best_ray_end), 3)
+            jerk_vec = best_ray_end - pos
+            if np.linalg.norm(jerk_vec) > 0:
+                pos = pos + DEFAULT_JERK * (jerk_vec / np.linalg.norm(jerk_vec))
+            print(f"Escaping via widest gap (#safe rays={score})")
+        else:
+            rand_ang = math.radians(np.random.uniform(-180, 180))
+            jitter = 0.1 * np.array([math.cos(rand_ang), math.sin(rand_ang)])
+            pos = pos + jitter
+            print("No safe rays found — random jitter applied")
+
+    pygame.display.flip()
+
+pygame.quit()
